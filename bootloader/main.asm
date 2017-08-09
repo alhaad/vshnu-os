@@ -1,3 +1,4 @@
+; This is the absolute memory address offset where bios loads the bootloader at.
 [org 0x7c00]
 
 call clear_screen
