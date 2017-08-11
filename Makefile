@@ -26,12 +26,12 @@ $(KERNEL_OBJECT): kernel.c
 	mkdir -p out
 	x86_64-elf-gcc -ffreestanding -c $< -o $@
 
-$(KERNEL_ENTRY): start.asm
+$(KERNEL_ENTRY): src/arch/x86_64/start.asm
 	mkdir -p out
 	nasm $< -felf64 -o $@
 
 $(KERNEL): $(KERNEL_ENTRY) $(KERNEL_OBJECT)
-	x86_64-elf-ld -o $@ -Ttext 0x1000 $^ --oformat binary
+	x86_64-elf-ld -n --gc-sections -T src/arch/x86_64/linker.ld -o $@ $^ --oformat binary
 
 $(ISO): $(BOOTLOADER_STAGE1) $(BOOTLOADER_STAGE2) $(KERNEL)
 	mkdir -p out/cdimg/boot
