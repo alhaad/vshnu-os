@@ -1,7 +1,7 @@
 global enter_kernel
 
 [bits 32]
-[extern main] ; Define calling point. Must have same name as kernel.c 'main' function
+[extern rust_main] ; Define calling point.
 
 section .text
 enter_kernel:
@@ -211,5 +211,5 @@ LongMode:
  
     mov rax, 0x1F211F641F6C1F72
     mov [edi + 16], rax
-    call main
+    call rust_main
     jmp $

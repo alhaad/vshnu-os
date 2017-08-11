@@ -1,0 +1,10 @@
+[package]
+name = "vshnu-os"
+version = "0.0.1"
+authors = ["Alhaad Gokhale"]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+rlibc = "1.0"
