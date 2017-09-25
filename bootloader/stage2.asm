@@ -1,95 +1,87 @@
-; Stage2 Bootloader
-; FS Agnostic
-; Expects a stage1 or install utility to fill in kernloc, kernsize, sectsize
-; 
-; Loads kernel to KERNEL and jumpts into it
+; Copyright 2017 Alhaad Gokhale. All rights reserved.
+; Use of this source code is governed by a BSD-style license that can
+; be found in the LICENSE file.
 
-[bits 16]                 ; using 16 bit assembly
-[org 0x0600]    
+%include "bootloader/include/gdt.inc"
+%include "bootloader/include/mem.inc"
 
-;--------------------------------------------------------
-; Environment Variables
-;--------------------------------------------------------
-INT13_TRIES   equ 0x05
-KERNEL_LOC    equ 0x7C00
-KERNEL        equ 0x100000
+; The second-stage bootloader starts in 16-bit real mode.
+[bits 16]
+[org Mem.Stage2]
 
-start: 
-      jmp    real_start
+start:
+	jmp real_start
 
-      times 8-($-$$) db 0
-kernloc   dd  0      ; LBA offset
-kernsize  dd  0      ; size in SECTORS
-sectsize  dd  0      ; size of a sector on drive in dl
+	; Create an 8-byte padding.
+	times 8-($-$$) db 0
 
-real_start:  
+Stage2.KernLBA dd 0
+Stage2.KernSize dd 0
 
-      mov    si, st_loaded
-      call  putstr
-      
-      mov    si, st_chkkern
-      call  putstr
-      cmp    dword [kernloc], 0
-      jz    .fail
-      cmp    dword [kernsize], 0
-      jz    .fail
-      mov    si, success
-      call  putstr
+real_start:
 
-      ; Enable A20 so we can access > 1mb of ram
-      mov    si, st_a20        
-      call  putstr
-      call  enablea20      ; call the a20 enabler
-      cmp   ax,0           ; did we succeed?
-      jnz   .fail          ; if ax is nonzero, no
-      mov    si, success 
-      call  putstr
+	; Check kernel info.
+	mov si, String.Chkkern
+	call PutStr
+	cmp dword [Stage2.KernLBA], 0
+	jz .fail
+	cmp dword [Stage2.KernSize], 0
+	jz .fail
+	mov si, String.Success
+	call PutStr
 
-      ; load kernel into memory
-      mov    si, st_ldkern 
-      call  putstr
-      call  loadkernel
-      cmp   ax, 0
-      jnz   .fail
-      mov    si, success
-      call  putstr
-     
-      ; Load GDT  
-      mov    si, st_gdt 
-      call  putstr
-      lgdt  [gdt_desc]    
-      mov    si, success
-      call  putstr
+	; Enable A20 so we can access > 1mb of ram
+	mov si, String.A20
+	call PutStr
+	call EnableA20
+	cmp ax, 0
+	jnz .fail
+	mov si, String.Success
+	call PutStr
 
-      ; Switch to pmode
-      mov    si, st_pmode
-      call  putstr
-      mov   eax, cr0      ; get current val
-      or    al, 1         ; set that bit
-      mov   cr0, eax      ; write it back
-      
-      jmp   0x10:start_pmode ; jump to clear pipeline of non-32b inst
+	; Load Kernel into memory.
+	; Enable interrupts while loading the kernel.
+	sti
+	; Use a temporary GDT while loading the kernel.
+	lgdt    [GDT32.Table.Pointer]
+	mov si, String.Ldkern
+	call PutStr
+	mov bx, [Stage2.KernLBA]
+	mov eax, [Stage2.KernSize]
+	call LoadKernel
+	jc .fail
+	mov si, String.Success
+	call PutStr
+	cli
 
-.fail:mov   si, fail
-      call  putstr 
-.end: sti
-      hlt                 ; Something foul happened :(
-      jmp   .end          ; just in case we get woken up
-     
+        ; Switch to 32-bit protected mode.
+	mov   eax, cr0
+	or    al, (1 << 0) 
+	mov   cr0, eax
+	jmp   GDT32.Selector.Code32:start_pmode ; jump to clear pipeline of non-32b inst
 
-;------------------------------------------------------------
-; Subroutines 
-;------------------------------------------------------------
-      
-; enablea20
-; 16bit, real mode
+.fail:
+	mov si, String.Fail
+	call PutStr
+.end:
+	hlt
+	jmp .end
+
+;=============================================================================
+; Subroutines
+;=============================================================================
+
+%include "bootloader/include/utils.inc"
+
+; EnableA20
 ; function to enable the a20 gate on a processor
 ; (allows access to greater range of memory)
 ; assumes:    none
 ; input:      none
 ; output:     ax=0 on success, nonzero on failure
 ; destroyed:  ax
-enablea20:
+EnableA20:
+	  cli
           call  wait_for_kbd_in   ; wait for kbd to clear
 
           mov   al, 0xD0          ; command to read status
@@ -123,7 +115,8 @@ enablea20:
           jmp   .return 
          
 .success: mov   ax, 0             ; code that we succeeded
-.return:  ret
+.return:  sti
+	  ret
 
 
 ; wait_for_kbd_in
@@ -151,166 +144,335 @@ wait_for_kbd_out:
           in    al, 0x64         ; read the port
           bt    ax, 0            ; see if bit 0 is 1 or not
           jnc   wait_for_kbd_out ; if it isn't, loop
-          ret  
+          ret
 
+;=============================================================================
+; LoadKernel
+;
+; Load the kernel into upper memory.
+;
+; There are two problems we need to solve:
+;
+;   1. In real mode, we have access to the BIOS but can only access the
+;      first megabyte of system memory.
+;   2. In protected mode, we can access memory above the first megabyte but
+;      don't have access to the BIOS.
+;
+; Since we need the BIOS to read the kernel from the CDROM and we need to load
+; it into upper memory, we'll have to switch back and forth between real mode
+; and protected mode to do it.
+;
+; This code repeats the following steps until the kernel is fully copied into
+; upper memory:
+;
+;     1. Use BIOS to read the next 64KiB of the kernel file into a lower
+;        memory buffer.
+;     2. Switch to 32-bit protected mode.
+;     3. Copy the 64KiB chunk from the lower memory buffer into the
+;        appropriate upper memory location.
+;     4. Switch back to real mode.
+;
+; Input registers:
+;   EAX     Size of the kernel file (in bytes)
+;   BX      Start sector of the kernel file
+;
+; Return flags:
+;   CF      Set on error
+;
+; Killed registers:
+;   None
+;=============================================================================
+LoadKernel:
+    ; Preserve registers.
+    push    es
+    pusha
 
-; loadkernel
-; 16 bit, real mode
-; loads kernel to specified location(s) KERNEL_LOC and KERNEL
-; KERNEL_LOC is the place in < 1mb of memory to cache kernel
-; KERNEL is the place in upper memory where the kernel will live
-; (BIOS can't write above 1mb, so we have to write to KERNEL_LOC
-; and then move it up to KERNEL - works because we're in unreal mode)
-; assumes:    We're in unreal mode, kernel can fit in lower memory
-; input:      none
-; output:     ax = 0 on success, nonzero on fail    
-; destroyed:  eax, bx, cx, esi, edi 
-loadkernel:
-           
-            ; So, there are some issues here
-            ; #1) There's only a limited amount of space to load to in <1mb
-            ; #2) int 13 might fail.  Retry
-            ; #3) There's a limited recommended amount of bytes to read with int13
-            mov   eax, [kernsize]             ; set up DAP
-            mov   word [numsect], ax
-            mov   eax, [kernloc]
-            mov   dword [lbanum], eax
-            mov   word [destoff], KERNEL_LOC  ; load to < 1mb
-            mov   word [destseg], ds  
-            mov   si, DAP
-            call  readmem         ; do the read
-            cmp   ah, 0           ; see if we failed
-            jnz   .done
-            
-            ; now we have to move to > 1mb 
-            call  unrealmode      ; setup unreal mode
-            mov   esi,KERNEL_LOC  ; place we're moving from
-            mov   edi,KERNEL      ; place we're moving to
-            
-            xor   ecx, ecx        ; clear ecx; used by a32 movsb
-            mov   bx, [kernsize]  ; loop variable - # of sectors
-.loop:      mov   cx, [sectsize]  ; number of bytes to transfer (1 sector)
-            a32   rep movsb       ; copies # of bytes in cx, increments esi and edi
-                                  ; 'a32' tells it to use esi/edi instead of si/di
-            dec   bx              ; i-- 
-            jnz   .loop
-            
-            mov   ax,0            ; error code = success
-.done:      ret
+    ; Preserve the real mode stack pointer.
+    mov     [LoadKernel.StackPointer],  sp
 
-; unrealmode
-; 16 bit, real mode
-; Function that sets up unreal mode
-; Assumes:    In real mode at start
-;             GDT properly set up at gdt_desc
-; Input:      none
-; Output:     none
-; Destroyed:  none (except segment caches)
-unrealmode:      
-      lgdt  [gdt_desc]    ; load the gdt
-      
-      push  ds            ; save original segments
-      push  es
-      push  ss
-      mov   eax, cr0      
-      or    al,1          ; switch to pmode
-      mov   cr0, eax
-      mov   bx, 0x08      ;load a selector
-      mov   ds, bx
-      mov   es, bx
-      mov   ss, bx   
-      and   al, 0xFE      ; switch back to (un)real
-      mov   cr0, eax      
-      pop   ss            ; restore real mode segments  
-      pop   es 
-      pop   ds            
-      ret
+    ; Retrieve the cdrom disk number.
+    ;mov     dl,     [Globals.DriveNumber]
 
+    ; Save the kernel size.
+    ;mov     [Globals.KernelSize],       eax
 
-; putstr
-;  16 bit, real mode
-;  Prints a null terminated string to screen
-; input:       string address to be in si
-; output:     none
-; destroyed:  ax, bx
-putstr:
-        mov    ah, 0x0E    ; function for printing
-        mov    bh, 0x00    ; page number
-        mov    bl, 0x07    ; color  
-        
-.ldchr: lodsb              ; put a byte of the string into al
-        cmp    al, 0
-        je     .done       ; if it's null/zero, all done
-        int    0x10        ; do the print
-        jmp    .ldchr      ; go to next char  
-  
-.done:  ret
+    ; Convert kernel size from bytes to sectors (after rounding up).
+    add     eax,    Mem.Sector.Buffer.Size - 1
+    shr     eax,    11
 
+    ; Store status in code memory, since it's hard to use the stack while
+    ; switching between real and protected modes.
+    mov     [LoadKernel.CurrentSector], bx
+    add     ax,                         bx
+    mov     [LoadKernel.LastSector],    ax
 
-; readmem
-; 16 bit, real mode
-; executes int13 ah=42, retrying appropriately in case of failure
-; input:      address of DAP in ds:si
-; output:     ah=0 on sucess, nonzero if fail
-; destroyed:  ax, cx
-readmem:  
-          mov   cx, INT13_TRIES   ; number of times to try
-.retry:   mov   ah, 0x42
-          int   0x13
-          jnc   .done
-          dec   cx
-          cmp   cx, 0
-          jz    .done
-          jmp   .retry
-.done:    ret 
+    .loadChunk:
 
+        ; Set target buffer for the read.
+	mov     cx,     Mem.Kernel.LoadBuffer >> 4
+	mov     es,     cx
+	xor     di,     di
+
+        ; Set the number of sectors to read (buffersize / 2048).
+        mov     cx,     Mem.Kernel.LoadBuffer.Size >> 11
+
+        ; Calculate the number of remaining sectors.
+        ; (ax = LastSector, bx = CurrentSector)
+        sub     ax,     bx
+
+        ; Are there fewer sectors to read than will fit in the buffer?
+        cmp     cx,     ax
+        jb      .proceed
+
+        ; Don't read more sectors than are left.
+        mov     cx,     ax
+
+    .proceed:
+
+        ; Store the number of sectors being loaded, so we can access it in
+        ; protected mode when we do the copy to upper memory.
+        mov     [LoadKernel.SectorsToCopy],     cx
+
+        ; Read a chunk of the kernel into the buffer.
+        call    ReadSectors
+        jc      .errorReal
+
+    .prepareProtected32Mode:
+
+        ; Disable interrupts until we're out of protected mode and back into
+        ; real mode, since we're not setting up a new interrupt table.
+        cli
+
+        ; Enable protected mode.
+        mov     eax,    cr0
+        or      eax,    (1 << 0)    ; CR.PE
+        mov     cr0,    eax
+
+        ; Do a far jump to switch to 32-bit protected mode.
+        jmp     GDT32.Selector.Code32 : .switchToProtected32Mode
+
+[bits 32]
+
+    .switchToProtected32Mode:
+
+        ; Initialize all data segment registers with the 32-bit protected mode
+        ; data segment selector.
+        mov     ax,     GDT32.Selector.Data32
+        mov     ds,     ax
+        mov     es,     ax
+        mov     ss,     ax
+
+        ; Create a temporary stack used only while in protected mode.
+        ; (probably not necessary since interrupts are disabled)
+        mov     esp,    Mem.Stack32.Temp.Top
+
+    .copyChunk:
+
+        ; Set up a copy from lower memory to upper memory using the number of
+        ; sectors.
+        xor     ecx,    ecx
+        xor     esi,    esi
+        xor     edi,    edi
+        mov     bx,     [LoadKernel.SectorsToCopy]
+        mov     cx,     bx
+        shl     ecx,    11       ; multiply by sector size (2048)
+        mov     esi,    Mem.Kernel.LoadBuffer
+        mov     edi,    [LoadKernel.TargetPointer]
+
+        ; Advance counters and pointers.
+        add     [LoadKernel.TargetPointer],     ecx
+        add     [LoadKernel.CurrentSector],     bx
+
+        ; Copy the chunk.
+        cld
+        shr     ecx,    2       ; divide by 4 since we're copying dwords.
+        rep     movsd
+
+    .prepareProtected16Mode:
+
+        ; Before we can switch back to real mode, we have to switch to
+        ; 16-bit protected mode.
+        jmp     GDT32.Selector.Code16 : .switchToProtected16Mode
+
+[bits 16]
+
+    .switchToProtected16Mode:
+
+        ; Initialize all data segment registers with the 16-bit protected mode
+        ; data segment selector.
+        mov     ax,     GDT32.Selector.Data16
+        mov     ds,     ax
+        mov     es,     ax
+        mov     ss,     ax
+
+    .prepareRealMode:
+
+        ; Disable protected mode.
+        mov     eax,    cr0
+        and     eax,    ~(1 << 0)   ; CR0.PE
+        mov     cr0,    eax
+
+        ; Do a far jump to switch back to real mode.
+        jmp     0x0000 : .switchToRealMode
+
+    .switchToRealMode:
+
+        ; Restore real mode data segment registers.
+        xor     ax,     ax
+        mov     ds,     ax
+        mov     es,     ax
+        mov     ss,     ax
+
+        ; Restore the real mode stack pointer.
+        xor     esp,    esp
+        mov     sp,     [LoadKernel.StackPointer]
+
+        ; Enable interrupts again.
+        sti
+
+    .checkCompletion:
+
+        ; Check if the copy is complete.
+        mov     ax,     [LoadKernel.LastSector]
+        mov     bx,     [LoadKernel.CurrentSector]
+        cmp     ax,     bx
+        je      .success
+
+        ; Proceed to the next chunk.
+        jmp     .loadChunk
+
+    .errorReal:
+
+        ; Set carry flag on error.
+        stc
+        jmp     .done
+
+    .success:
+
+        ; Clear carry on success.
+        clc
+
+    .done:
+
+        ; Wipe the sector load buffer.
+        mov     ax,     Mem.Kernel.LoadBuffer >> 4
+        mov     es,     ax
+        xor     ax,     ax
+        xor     di,     di
+        mov     cx,     Mem.Kernel.LoadBuffer.Size - 1
+        rep     stosb
+        inc     cx
+        stosb
+
+        ; Clear upper word of 32-bit registers we used.
+        xor     eax,    eax
+        xor     ecx,    ecx
+        xor     esi,    esi
+        xor     edi,    edi
+
+        ; Restore registers.
+        popa
+        pop     es
+
+        ret
+
+;-----------------------------------------------------------------------------
+; LoadKernel state variables
+;-----------------------------------------------------------------------------
+align 4
+LoadKernel.TargetPointer        dd      Mem.Kernel.Image
+LoadKernel.CurrentSector        dw      0
+LoadKernel.LastSector           dw      0
+LoadKernel.SectorsToCopy        dw      0
+LoadKernel.StackPointer         dw      0
 
 ; start_pmode
 ; label in 32bit assembly used in the far jump to clear pipeline for switching from
 ; real16bit to protected32bit mode
 [BITS 32]
 start_pmode:
-            mov ax, 0x08        ; need to load data segment into ds/ss
+            mov ax, GDT32.Selector.Data32    ; need to load data segment into ds/ss
             mov ds, ax
             mov es, ax 
             mov ss, ax
-            mov esp, 0x090000   ; move stack pointer to 090000h, gives us a 65kb stack
-                                ; this is probably a weird place for a stack long term
-            xchg  bx, bx 
-            jmp 0x10:KERNEL     ; jmp to kernel!
+            jmp Mem.Kernel.Image     ; jmp to kernel!
 
-;----------------------------------------------------------
-; Data
-;----------------------------------------------------------
+;=============================================================================
+; Global data
+;=============================================================================
 
-; Disk Address Packet
-; (data structure used by int13 ah=42)
-DAP:
-          db    0x10       ; size of this packet
-          db    0          ; always zero
-numsect   dw    0          ; number of sectors to transfer
-destoff   dw    0          ; segment and offset in mem
-destseg   dw    0
-lbanum    dd    0          ; lba to read
-lbanum2   dd    0          ; extra space for lba offset
+;-----------------------------------------------------------------------------
+; Global Descriptor Table used (temporarily) in 32-bit protected mode
+;-----------------------------------------------------------------------------
+align 4
+GDT32.Table:
 
+    ; Null descriptor
+    istruc GDT.Descriptor
+        at GDT.Descriptor.LimitLow,            dw      0x0000
+        at GDT.Descriptor.BaseLow,             dw      0x0000
+        at GDT.Descriptor.BaseMiddle,          db      0x00
+        at GDT.Descriptor.Access,              db      0x00
+        at GDT.Descriptor.LimitHighFlags,      db      0x00
+        at GDT.Descriptor.BaseHigh,            db      0x00
+    iend
 
-; GDT
-gdt:      dq   0                           ; need a null segment
-          dw  0xFFFF, 0, 0x9200, 0x00CF  ; data
-          dw  0xFFFF, 0, 0x9A00, 0x00CF  ; code
-gdt_end:
-gdt_desc:
-          dw  gdt_end - gdt - 1       ; first word is expected to be size of gdt-1
-          dd  gdt                     ; then the gdt address
+    ; 32-bit protected mode - code segment descriptor (selector = 0x08)
+    ; (Base=0, Limit=4GiB-1, RW=1, DC=0, EX=1, PR=1, Priv=0, SZ=1, GR=1)
+    istruc GDT.Descriptor
+        at GDT.Descriptor.LimitLow,            dw      0xffff
+        at GDT.Descriptor.BaseLow,             dw      0x0000
+        at GDT.Descriptor.BaseMiddle,          db      0x00
+        at GDT.Descriptor.Access,              db      10011010b
+        at GDT.Descriptor.LimitHighFlags,      db      11001111b
+        at GDT.Descriptor.BaseHigh,            db      0x00
+    iend
+
+    ; 32-bit protected mode - data segment descriptor (selector = 0x10)
+    ; (Base=0, Limit=4GiB-1, RW=1, DC=0, EX=0, PR=1, Priv=0, SZ=1, GR=1)
+    istruc GDT.Descriptor
+        at GDT.Descriptor.LimitLow,            dw      0xffff
+        at GDT.Descriptor.BaseLow,             dw      0x0000
+        at GDT.Descriptor.BaseMiddle,          db      0x00
+        at GDT.Descriptor.Access,              db      10010010b
+        at GDT.Descriptor.LimitHighFlags,      db      11001111b
+        at GDT.Descriptor.BaseHigh,            db      0x00
+    iend
+
+    ; 16-bit protected mode - code segment descriptor (selector = 0x18)
+    ; (Base=0, Limit=1MiB-1, RW=1, DC=0, EX=1, PR=1, Priv=0, SZ=0, GR=0)
+    istruc GDT.Descriptor
+        at GDT.Descriptor.LimitLow,            dw      0xffff
+        at GDT.Descriptor.BaseLow,             dw      0x0000
+        at GDT.Descriptor.BaseMiddle,          db      0x00
+        at GDT.Descriptor.Access,              db      10011010b
+        at GDT.Descriptor.LimitHighFlags,      db      00000001b
+        at GDT.Descriptor.BaseHigh,            db      0x00
+    iend
+
+    ; 16-bit protected mode - data segment descriptor (selector = 0x20)
+    ; (Base=0, Limit=1MiB-1, RW=1, DC=0, EX=0, PR=1, Priv=0, SZ=0, GR=0)
+    istruc GDT.Descriptor
+        at GDT.Descriptor.LimitLow,            dw      0xffff
+        at GDT.Descriptor.BaseLow,             dw      0x0000
+        at GDT.Descriptor.BaseMiddle,          db      0x00
+        at GDT.Descriptor.Access,              db      10010010b
+        at GDT.Descriptor.LimitHighFlags,      db      00000001b
+        at GDT.Descriptor.BaseHigh,            db      0x00
+    iend
+
+GDT32.Table.Size    equ     ($ - GDT32.Table)
+
+GDT32.Table.Pointer:
+    dw  GDT32.Table.Size - 1    ; Limit = offset of last byte in table
+    dd  GDT32.Table
 
 ; Strings for printing status
-st_loaded         db  'VSNU-OS 2nd Stage Bootloader',13,10,0
-st_chkkern        db  'Checking Kernel Info................',0
-st_a20            db  'Enabling A20........................',0
-st_gdt            db  'Loading GDT.........................',0
-st_ldkern         db  'Loading Kernel......................',0
-st_pmode          db  'Switching to PMode..................',0
+String.Chkkern        db  'Checking Kernel Info................',0
+String.A20            db  'Enabling A20........................',0
+String.Ldkern         db  'Loading Kernel......................',0
+String.Rnkern          db  'Starting VSHNU-OS kernel..................',0
+
 ; Success and fail strings;
-success           db  'Done',13,10,0
-fail              db  'Fail',13,10,0
+String.Success           db  'Done',13,10,0
+String.Fail              db  'Fail',13,10,0

@@ -38,7 +38,10 @@ $(ISO): $(BOOTLOADER_STAGE1) $(BOOTLOADER_STAGE2) $(KERNEL)
 	mkisofs -R -b boot/stage1 -no-emul-boot -boot-load-size 4 -o $@ out/cdimg
 
 run: $(ISO)
-	qemu-system-x86_64 -cdrom $< -s
+	qemu-system-x86_64 -cdrom $< -boot d -s
+
+debug: $(ISO)
+	qemu-system-x86_64 -cdrom $< -boot d -s -S
 
 clean:
 	cargo clean
