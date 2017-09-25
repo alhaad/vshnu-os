@@ -8,7 +8,7 @@ BOOTLOADER_STAGE1 := out/stage1
 BOOTLOADER_STAGE2 := out/stage2
 KERNEL := out/kernel
 KERNEL_ENTRY := out/start.o
-RUST_OS := target/x86_64-vshnu-os/release/libvshnu_os.a
+RUST_OS := target/x86_64-vshnu-os/debug/libvshnu_os.a
 
 .PHONY: all clean
 
@@ -23,14 +23,14 @@ $(BOOTLOADER_STAGE2): bootloader/stage2.asm
 	nasm $< -fbin -o $@
 
 $(RUST_OS): src/lib.rs
-	xargo build --release --target x86_64-vshnu-os
+	xargo build --target x86_64-vshnu-os
 
 $(KERNEL_ENTRY): src/arch/x86_64/start.asm
 	mkdir -p out
 	nasm $< -felf64 -o $@
 
 $(KERNEL): $(KERNEL_ENTRY) $(RUST_OS)
-	x86_64-elf-ld -n --gc-sections -T src/arch/x86_64/linker.ld -o $@ $^ --oformat binary
+	x86_64-elf-ld -n -T src/arch/x86_64/linker.ld -o $@ $^ --oformat binary
 
 $(ISO): $(BOOTLOADER_STAGE1) $(BOOTLOADER_STAGE2) $(KERNEL)
 	mkdir -p out/cdimg/boot

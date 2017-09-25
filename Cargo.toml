@@ -7,4 +7,5 @@ authors = ["Alhaad Gokhale"]
 crate-type = ["staticlib"]
 
 [dependencies]
+compiler_builtins = { git = "https://github.com/rust-lang-nursery/compiler-builtins" }
 rlibc = "1.0"

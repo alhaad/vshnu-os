@@ -2,8 +2,14 @@
 name = "vshnu-os"
 version = "0.0.1"
 dependencies = [
+ "compiler_builtins 0.1.0 (git+https://github.com/rust-lang-nursery/compiler-builtins)",
  "rlibc 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
+
+[[package]]
+name = "compiler_builtins"
+version = "0.1.0"
+source = "git+https://github.com/rust-lang-nursery/compiler-builtins#67e0908d7f2fd86423ec32fc4d904952fe96e7a9"
 
 [[package]]
 name = "rlibc"
@@ -11,4 +17,5 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [metadata]
+"checksum compiler_builtins 0.1.0 (git+https://github.com/rust-lang-nursery/compiler-builtins)" = "<none>"
 "checksum rlibc 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "fc874b127765f014d792f16763a81245ab80500e2ad921ed4ee9e82481ee08fe"
